@@ -141,6 +141,45 @@ if risk_flag:
     add_line("")
     add_line("⚠ 崩れモード警戒（半導体指数 or VIX急変）")
 
+# ===== SOXX 長期トレンド監視 =====
+soxx_hist = yf.Ticker("SOXX").history(period="1y")
+
+if len(soxx_hist) >= 200:
+    soxx_ma200 = soxx_hist["Close"].rolling(200).mean().iloc[-1]
+    soxx_now = soxx_hist["Close"].iloc[-1]
+
+    if soxx_now < soxx_ma200:
+        score -= 15
+        risk_flag = True
+        add_line("⚠ SOXXが200日線割れ（長期トレンド崩れ）")
+
+# ===== NASDAQ 長期監視 =====
+nasdaq_hist = yf.Ticker("^IXIC").history(period="1y")
+
+if len(nasdaq_hist) >= 200:
+    nasdaq_ma200 = nasdaq_hist["Close"].rolling(200).mean().iloc[-1]
+    nasdaq_now = nasdaq_hist["Close"].iloc[-1]
+
+    if nasdaq_now < nasdaq_ma200:
+        score -= 10
+        risk_flag = True
+        add_line("⚠ NASDAQが200日線割れ（市場全体弱気）")
+
+# ===== VIX急騰強化 =====
+vix_hist = yf.Ticker("^VIX").history(period="5d")
+
+if len(vix_hist) >= 2:
+    vix_now = vix_hist["Close"].iloc[-1]
+    vix_prev = vix_hist["Close"].iloc[-2]
+
+    vix_change = ((vix_now - vix_prev) / vix_prev) * 100
+
+    if vix_change > 10:
+        score -= 10
+        risk_flag = True
+        add_line("⚠ VIX急騰（恐怖拡大）")
+
+
 # ===== ニュース取得 =====
 
 NEWS_API_KEY = os.getenv("NEWS_API_KEY")

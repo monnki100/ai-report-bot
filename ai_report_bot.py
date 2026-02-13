@@ -163,17 +163,42 @@ for n in news:
 # ===== メール送信 =====
 
 import smtplib
+from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
 gmail_user = os.getenv("GMAIL_ADDRESS")
 gmail_password = os.getenv("GMAIL_APP_PASSWORD")
 
-subject = "Daily AI Stock Report"
+if risk_flag:
+    subject = "⚠ AI市場警戒アラート"
+else:
+    subject = "Daily AI Stock Report"
 
-msg = MIMEText(report)
+html = f"""
+<html>
+<body style="font-family:Arial;">
+<h2>📊 AI市場プロレポート</h2>
+<p><b>日付:</b> {datetime.date.today()}</p>
+<p><b>市場温度:</b> {score} {temp}</p>
+
+<hr>
+<pre>
+{report}
+</pre>
+
+{"<h3 style='color:red;'>⚠ 崩れモード発動</h3>" if risk_flag else ""}
+
+</body>
+</html>
+"""
+
+msg = MIMEMultipart("alternative")
 msg["Subject"] = subject
 msg["From"] = gmail_user
 msg["To"] = gmail_user
+
+msg.attach(MIMEText(report, "plain"))
+msg.attach(MIMEText(html, "html"))
 
 try:
     with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
@@ -182,4 +207,3 @@ try:
     print("Email sent successfully!")
 except Exception as e:
     print("Email failed:", e)
-

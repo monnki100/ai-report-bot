@@ -1,6 +1,8 @@
 import yfinance as yf
 import datetime
 import pandas as pd
+import requests
+import os
 
 tickers = {
     "NVDA": "NVIDIA",
@@ -12,6 +14,8 @@ tickers = {
     "GOOGL": "Alphabet",
     "^GSPC": "S&P500",
     "^VIX": "VIX"
+    "SOXX": "SOXX",
+    "^IXIC": "NASDAQ"
 }
 
 def calculate_rsi(data, period=14):
@@ -41,6 +45,7 @@ for ticker in tickers:
     change = (current_price / prev_price - 1) * 100
 
     ma50 = hist["Close"].rolling(50).mean().iloc[-1]
+    ma200 = hist["Close"].rolling(200).mean().iloc[-1]
     rsi = calculate_rsi(hist["Close"]).iloc[-1]
 
     volume_today = hist["Volume"].iloc[-1]
@@ -49,6 +54,7 @@ for ticker in tickers:
     report_data[ticker] = {
         "change": round(change,2),
         "ma50": round(ma50,2),
+        "ma200": round(ma200,2),
         "rsi": round(rsi,2),
         "volume_ratio": round(volume_today/volume_avg,2)
     }
@@ -86,6 +92,14 @@ elif score >= 30:
 else:
     temp = "❄ 崩れ"
 
+risk_flag = False
+
+if "SOXX" in report_data and report_data["SOXX"]["change"] < -3:
+    risk_flag = True
+
+if "^VIX" in report_data and report_data["^VIX"]["change"] > 7:
+    risk_flag = True
+
 # 出力
 print("===== AI市場プロレポート =====")
 print("日付:", datetime.date.today())
@@ -113,3 +127,20 @@ elif score >= 45:
 else:
     print("・信用縮小")
     print("・ディフェンシブ優先")
+if risk_flag:
+    print("\n⚠ 崩れモード警戒（半導体指数 or VIX急変）")
+
+NEWS_API_KEY = os.getenv("NEWS_API_KEY")
+
+def get_ai_news():
+    url = f"https://newsapi.org/v2/everything?q=AI+semiconductor&language=en&sortBy=publishedAt&pageSize=5&apiKey={NEWS_API_KEY}"
+    response = requests.get(url)
+    articles = response.json().get("articles", [])
+    headlines = [a["title"] for a in articles]
+    return headlines
+
+news = get_ai_news()
+
+print("\n■ AI関連最新ニュース")
+for n in news:
+    print("-", n)

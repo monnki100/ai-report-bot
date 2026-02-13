@@ -100,35 +100,48 @@ if "SOXX" in report_data and report_data["SOXX"]["change"] < -3:
 if "^VIX" in report_data and report_data["^VIX"]["change"] > 7:
     risk_flag = True
 
-# 出力
-print("===== AI市場プロレポート =====")
-print("日付:", datetime.date.today())
-print("市場温度:", score, temp)
-print("")
+# ===== 出力 =====
+
+report = ""
+
+def add_line(text=""):
+    print(text)
+    global report
+    report += text + "\n"
+
+add_line("===== AI市場プロレポート =====")
+add_line(f"日付: {datetime.date.today()}")
+add_line(f"市場温度: {score} {temp}")
+add_line("")
 
 for ticker, name in tickers.items():
     if ticker in report_data:
         d = report_data[ticker]
-        print(f"{name} ({ticker})")
-        print(f"  前日比: {d['change']}%")
-        print(f"  MA50: {d['ma50']}")
-        print(f"  RSI: {d['rsi']}")
-        print(f"  出来高倍率: {d['volume_ratio']}倍")
-        print("")
+        add_line(f"{name} ({ticker})")
+        add_line(f"  前日比: {d['change']}%")
+        add_line(f"  MA50: {d['ma50']}")
+        add_line(f"  MA200: {d['ma200']}")
+        add_line(f"  RSI: {d['rsi']}")
+        add_line(f"  出来高倍率: {d['volume_ratio']}倍")
+        add_line("")
 
-print("■ 戦略指針")
+add_line("■ 戦略指針")
 
 if score >= 65:
-    print("・押し目積極")
-    print("・トレンドフォロー有効")
+    add_line("・押し目積極")
+    add_line("・トレンドフォロー有効")
 elif score >= 45:
-    print("・ポジション維持")
-    print("・新規は選別")
+    add_line("・ポジション維持")
+    add_line("・新規は選別")
 else:
-    print("・信用縮小")
-    print("・ディフェンシブ優先")
+    add_line("・信用縮小")
+    add_line("・ディフェンシブ優先")
+
 if risk_flag:
-    print("\n⚠ 崩れモード警戒（半導体指数 or VIX急変）")
+    add_line("")
+    add_line("⚠ 崩れモード警戒（半導体指数 or VIX急変）")
+
+# ===== ニュース取得 =====
 
 NEWS_API_KEY = os.getenv("NEWS_API_KEY")
 
@@ -141,6 +154,32 @@ def get_ai_news():
 
 news = get_ai_news()
 
-print("\n■ AI関連最新ニュース")
+add_line("")
+add_line("■ AI関連最新ニュース")
+
 for n in news:
-    print("-", n)
+    add_line(f"- {n}")
+
+# ===== メール送信 =====
+
+import smtplib
+from email.mime.text import MIMEText
+
+gmail_user = os.getenv("GMAIL_ADDRESS")
+gmail_password = os.getenv("GMAIL_APP_PASSWORD")
+
+subject = "Daily AI Stock Report"
+
+msg = MIMEText(report)
+msg["Subject"] = subject
+msg["From"] = gmail_user
+msg["To"] = gmail_user
+
+try:
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+        server.login(gmail_user, gmail_password)
+        server.send_message(msg)
+    print("Email sent successfully!")
+except Exception as e:
+    print("Email failed:", e)
+

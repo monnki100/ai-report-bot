@@ -13,7 +13,7 @@ tickers = {
     "AMZN": "Amazon",
     "GOOGL": "Alphabet",
     "^GSPC": "S&P500",
-    "^VIX": "VIX"
+    "^VIX": "VIX",
     "SOXX": "SOXX",
     "^IXIC": "NASDAQ"
 }

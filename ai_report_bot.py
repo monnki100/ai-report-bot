@@ -1,12 +1,8 @@
 import yfinance as yf
-import requests
-from openai import OpenAI
-import datetime
 import os
+from openai import OpenAI
 
-# APIキー取得（後で設定します）
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-NEWS_API_KEY = os.getenv("NEWS_API_KEY")
 
 tickers = ["NVDA","MU","AMD","AVGO","MSFT","AMZN","GOOGL","^GSPC","^VIX"]
 
@@ -22,8 +18,6 @@ for t in tickers:
         data[t] = 0
 
 score = 50
-
-# 簡易スコアロジック
 if data["NVDA"] > 2:
     score += 10
 if data["^VIX"] > 5:
@@ -35,20 +29,13 @@ AI市場データ:
 
 市場温度スコア: {score}
 
-日本のAI集中投資家向けに、
-・市場温度評価
-・半導体状況
-・リスク
-・今日の戦略
-を簡潔にまとめてください。
+市場レポートを作成してください。
 """
 
 response = client.chat.completions.create(
     model="gpt-4o-mini",
-    messages=[{"role":"user","content":prompt}]
+    messages=[{"role": "user", "content": prompt}]
 )
 
-report = response.choices[0].message.content
-
 print("===== AI市場レポート =====")
-print(report)
+print(response.choices[0].message.content)

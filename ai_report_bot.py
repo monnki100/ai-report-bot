@@ -182,6 +182,106 @@ else:
     else:
         allocation = {"cash":70,"semiconductor":5,"ai_large":5,"defensive":20}
 
+# ===== 銘柄別配分 =====
+
+semiconductor_stocks = ["NVDA","AMD","AVGO","MU"]
+ai_large_stocks = ["MSFT","AMZN","GOOGL"]
+
+def distribute(group, total_weight):
+
+    strong = []
+    normal = []
+    reduced = []
+
+    for ticker in group:
+        if ticker in report_data:
+            d = report_data[ticker]
+
+            trend_ok = d["ma50"] > d["ma200"]
+            rsi = d["rsi"]
+
+            if d["change"] > 2 and trend_ok and 40 <= rsi <= 65:
+                strong.append(ticker)
+            elif rsi > 70:
+                reduced.append(ticker)
+            else:
+                normal.append(ticker)
+
+    result = {}
+
+    if strong:
+        strong_weight = total_weight * 0.6
+        normal_weight = total_weight * 0.3
+        reduced_weight = total_weight * 0.1
+    else:
+        strong_weight = total_weight * 0.5
+        normal_weight = total_weight * 0.4
+        reduced_weight = total_weight * 0.1
+
+    if strong:
+        for t in strong:
+            result[t] = round(strong_weight / len(strong),1)
+
+    if normal:
+        for t in normal:
+            result[t] = round(normal_weight / len(normal),1)
+
+    if reduced:
+        for t in reduced:
+            result[t] = round(reduced_weight / len(reduced),1)
+
+    return result
+
+
+# グループ配分
+detailed_allocation = {}
+
+detailed_allocation.update(
+    distribute(semiconductor_stocks, allocation["semiconductor"])
+)
+
+detailed_allocation.update(
+    distribute(ai_large_stocks, allocation["ai_large"])
+)
+
+
+# ===== NVDAブースト =====
+
+if "NVDA" in detailed_allocation:
+    if score >= 65:
+        detailed_allocation["NVDA"] += 5
+    if risk_flag:
+        detailed_allocation["NVDA"] -= 5
+    if "NVDA" in report_data:
+    if report_data["NVDA"]["rsi"] < 35:
+        detailed_allocation["NVDA"] += 3
+
+
+# ===== VIXボラ調整 =====
+
+vix_value = report_data.get("^VIX", {}).get("change", 0)
+
+vol_factor = 1.0
+
+if vix_value > 5:
+    vol_factor = 0.8
+elif vix_value < -3:
+    vol_factor = 1.1
+
+for t in detailed_allocation:
+    detailed_allocation[t] = round(detailed_allocation[t] * vol_factor,1)
+
+# ===== 正規化（合計を元の配分に戻す） =====
+
+total_weight = sum(detailed_allocation.values())
+
+target_total = allocation["semiconductor"] + allocation["ai_large"]
+
+if total_weight > 0:
+    scale = target_total / total_weight
+    for t in detailed_allocation:
+        detailed_allocation[t] = round(detailed_allocation[t] * scale,1)
+
 # ===== レポート生成 =====
 
 report = ""
@@ -218,12 +318,24 @@ if risk_flag:
     add_line("⚠ 崩れモード発動")
 
 add_line("")
+add_line("■ 押し目候補")
+
+for ticker, d in report_data.items():
+    if d["change"] < -4 and d["rsi"] < 35 and d["ma50"] > d["ma200"]:
+        add_line(f"・{ticker} 押し目候補")
+
+add_line("")
 add_line("■ 推奨ポジション配分")
 
 add_line(f"現金: {allocation['cash']}%")
 add_line(f"半導体: {allocation['semiconductor']}%")
 add_line(f"AI大型株: {allocation['ai_large']}%")
 add_line(f"ディフェンシブ: {allocation['defensive']}%")
+
+add_line("")
+add_line("■ 銘柄別詳細配分")
+for t, w in detailed_allocation.items():
+    add_line(f"{t}: {w}%")
 
 # ===== メール送信 =====
 

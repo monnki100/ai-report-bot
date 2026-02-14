@@ -161,6 +161,27 @@ elif score >= 30:
 else:
     temp = "❄ 崩れ"
 
+# ===== ポジション提案 =====
+
+if risk_flag:
+    allocation = {
+        "cash": 70,
+        "semiconductor": 5,
+        "ai_large": 5,
+        "defensive": 20
+    }
+else:
+    if score >= 80:
+        allocation = {"cash":10,"semiconductor":40,"ai_large":40,"defensive":10}
+    elif score >= 65:
+        allocation = {"cash":20,"semiconductor":35,"ai_large":35,"defensive":10}
+    elif score >= 45:
+        allocation = {"cash":35,"semiconductor":25,"ai_large":25,"defensive":15}
+    elif score >= 30:
+        allocation = {"cash":50,"semiconductor":15,"ai_large":15,"defensive":20}
+    else:
+        allocation = {"cash":70,"semiconductor":5,"ai_large":5,"defensive":20}
+
 # ===== レポート生成 =====
 
 report = ""
@@ -195,6 +216,14 @@ if negative_count >= 2:
 if risk_flag:
     add_line("")
     add_line("⚠ 崩れモード発動")
+
+add_line("")
+add_line("■ 推奨ポジション配分")
+
+add_line(f"現金: {allocation['cash']}%")
+add_line(f"半導体: {allocation['semiconductor']}%")
+add_line(f"AI大型株: {allocation['ai_large']}%")
+add_line(f"ディフェンシブ: {allocation['defensive']}%")
 
 # ===== メール送信 =====
 

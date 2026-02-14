@@ -1,10 +1,12 @@
 import yfinance as yf
 import datetime
 import pandas as pd
+import numpy as np
 import requests
 import os
 import smtplib
 import logging
+import xml.etree.ElementTree as ET
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from deep_translator import GoogleTranslator
@@ -92,15 +94,21 @@ def fetch_technical_data(ticker_symbol: str) -> dict | None:
     current = close.iloc[-1]
     prev = close.iloc[-2]
 
+    # 出来高倍率（VIX等、出来高がない銘柄はN/A扱い）
+    vol_avg = hist["Volume"].rolling(20).mean().iloc[-1]
+    vol_current = hist["Volume"].iloc[-1]
+    if pd.notna(vol_avg) and vol_avg > 0 and pd.notna(vol_current):
+        volume_ratio = round(vol_current / vol_avg, 2)
+    else:
+        volume_ratio = None
+
     return {
         "current": round(current, 2),
         "change": round((current / prev - 1) * 100, 2),
         "ma50": round(close.rolling(50).mean().iloc[-1], 2),
         "ma200": round(close.rolling(200).mean().iloc[-1], 2),
         "rsi": round(calculate_rsi(close).iloc[-1], 2),
-        "volume_ratio": round(
-            hist["Volume"].iloc[-1] / hist["Volume"].rolling(20).mean().iloc[-1], 2
-        ),
+        "volume_ratio": volume_ratio,
     }
 
 
@@ -311,29 +319,46 @@ def apply_vix_adjustment(
     return detailed
 
 
-# ===== ニュース取得 =====
+# ===== ニュース取得（Google News RSS） =====
+
+GOOGLE_NEWS_RSS_QUERIES = [
+    "AI semiconductor",
+    "NVIDIA AMD stock",
+]
 
 
 def get_ai_news() -> list[str]:
-    api_key = os.getenv("NEWS_API_KEY")
-    if not api_key:
-        logger.warning("NEWS_API_KEY が設定されていません")
-        return []
+    """Google News RSSから最新ニュースタイトルを取得（APIキー不要）"""
+    titles = []
 
-    url = (
-        "https://newsapi.org/v2/top-headlines?"
-        "q=AI+semiconductor+NVIDIA+AMD&"
-        "language=en&pageSize=5&"
-        f"apiKey={api_key}"
-    )
-    try:
-        r = requests.get(url, timeout=10)
-        r.raise_for_status()
-        data = r.json()
-        return [a["title"] for a in data.get("articles", []) if a.get("title")]
-    except Exception as e:
-        logger.error(f"ニュース取得失敗: {e}")
-        return []
+    for query in GOOGLE_NEWS_RSS_QUERIES:
+        url = (
+            "https://news.google.com/rss/search?"
+            f"q={query.replace(' ', '+')}&hl=en-US&gl=US&ceid=US:en"
+        )
+        try:
+            r = requests.get(url, timeout=10)
+            r.raise_for_status()
+            root = ET.fromstring(r.content)
+
+            for item in root.findall(".//item")[:3]:
+                title_el = item.find("title")
+                if title_el is not None and title_el.text:
+                    titles.append(title_el.text)
+        except Exception as e:
+            logger.error(f"Google News RSS取得失敗 ({query}): {e}")
+
+    # 重複除去して最大5件
+    seen = set()
+    unique = []
+    for t in titles:
+        if t not in seen:
+            seen.add(t)
+            unique.append(t)
+        if len(unique) >= 5:
+            break
+
+    return unique
 
 
 def analyze_news(news: list[str]) -> tuple[list[str], int]:
@@ -398,7 +423,8 @@ def generate_report(
         lines.append(f"  MA50: {d['ma50']}")
         lines.append(f"  MA200: {d['ma200']}")
         lines.append(f"  RSI: {d['rsi']}")
-        lines.append(f"  出来高倍率: {d['volume_ratio']}倍")
+        vol_str = f"{d['volume_ratio']}倍" if d['volume_ratio'] is not None else "N/A"
+        lines.append(f"  出来高倍率: {vol_str}")
         lines.append("")
 
     # ニュース

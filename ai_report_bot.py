@@ -4,9 +4,7 @@ import pandas as pd
 import requests
 import os
 import smtplib
-import json
 import logging
-from pathlib import Path
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from deep_translator import GoogleTranslator
@@ -18,11 +16,6 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s"
 )
 logger = logging.getLogger(__name__)
-
-# ===== パス設定（スクリプト基準の絶対パス） =====
-
-BASE_DIR = Path(__file__).resolve().parent
-ALLOCATION_FILE = BASE_DIR / "last_allocation.json"
 
 # ===== 銘柄設定 =====
 
@@ -255,21 +248,9 @@ def distribute(group: list[str], total_weight: float, report_data: dict) -> dict
 
 
 def build_detailed_allocation(
-    allocation: dict, report_data: dict, rebalance: bool
+    allocation: dict, report_data: dict
 ) -> dict:
-    """銘柄別の詳細配分を構築。リバランス日以外は前回の配分を維持。"""
-
-    if not rebalance:
-        try:
-            with open(ALLOCATION_FILE, "r") as f:
-                saved = json.load(f)
-                if saved:
-                    logger.info("前回の配分を読み込みました")
-                    return saved
-        except (FileNotFoundError, json.JSONDecodeError) as e:
-            logger.warning(f"保存済み配分の読み込み失敗（新規計算します）: {e}")
-
-    # 新規計算
+    """銘柄別の詳細配分を毎回最新データで構築。"""
     detailed = {}
     detailed.update(
         distribute(semiconductor_stocks, allocation["semiconductor"], report_data)
@@ -277,15 +258,6 @@ def build_detailed_allocation(
     detailed.update(
         distribute(ai_large_stocks, allocation["ai_large"], report_data)
     )
-
-    # 保存
-    try:
-        with open(ALLOCATION_FILE, "w") as f:
-            json.dump(detailed, f, indent=2)
-        logger.info("配分を保存しました")
-    except Exception as e:
-        logger.error(f"配分の保存失敗: {e}")
-
     return detailed
 
 
@@ -551,9 +523,9 @@ def main():
     # 6. リバランス判定
     rebalance = is_rebalance_day()
 
-    # 7. 銘柄別詳細配分
+    # 7. 銘柄別詳細配分（毎日最新データで計算）
     detailed_allocation = build_detailed_allocation(
-        allocation, report_data, rebalance
+        allocation, report_data
     )
 
     # 8. NVDAブースト

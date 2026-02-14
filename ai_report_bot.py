@@ -15,7 +15,7 @@ from deep_translator import GoogleTranslator
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s"
+    format="%(asctime)s [%(levelname)s] %(message)s",
 )
 logger = logging.getLogger(__name__)
 
@@ -36,6 +36,13 @@ tickers = {
 
 # VIXは別管理（二重取得・二重判定を防止）
 VIX_TICKER = "^VIX"
+
+# マクロ指標
+MACRO_TICKERS = {
+    "^TNX": "米10年債利回り",
+    "JPY=X": "USD/JPY",
+    "GC=F": "金(Gold)",
+}
 
 negative_keywords = [
     "lawsuit", "crash", "downgrade", "fraud", "investigation",
@@ -74,6 +81,15 @@ def clamp(value: float, low: float = 0, high: float = 100) -> float:
     return max(low, min(high, value))
 
 
+def diff_arrow(current: float, previous: float) -> str:
+    """前日比の矢印表示を生成"""
+    diff = current - previous
+    if abs(diff) < 0.01:
+        return "→ (変化なし)"
+    arrow = "↑" if diff > 0 else "↓"
+    return f"{arrow} {diff:+.2f}"
+
+
 # ===== テクニカルデータ取得 =====
 
 
@@ -94,6 +110,14 @@ def fetch_technical_data(ticker_symbol: str) -> dict | None:
     current = close.iloc[-1]
     prev = close.iloc[-2]
 
+    # 2日前（前日比較用）
+    prev2 = close.iloc[-3] if len(close) >= 3 else None
+    prev_change = round((prev / prev2 - 1) * 100, 2) if prev2 else None
+
+    rsi_series = calculate_rsi(close)
+    rsi_today = round(rsi_series.iloc[-1], 2)
+    rsi_prev = round(rsi_series.iloc[-2], 2) if len(rsi_series) >= 2 else None
+
     # 出来高倍率（VIX等、出来高がない銘柄はN/A扱い）
     vol_avg = hist["Volume"].rolling(20).mean().iloc[-1]
     vol_current = hist["Volume"].iloc[-1]
@@ -105,20 +129,52 @@ def fetch_technical_data(ticker_symbol: str) -> dict | None:
     return {
         "current": round(current, 2),
         "change": round((current / prev - 1) * 100, 2),
+        "prev_change": prev_change,
         "ma50": round(close.rolling(50).mean().iloc[-1], 2),
         "ma200": round(close.rolling(200).mean().iloc[-1], 2),
-        "rsi": round(calculate_rsi(close).iloc[-1], 2),
+        "rsi": rsi_today,
+        "rsi_prev": rsi_prev,
         "volume_ratio": volume_ratio,
     }
+
+
+# ===== マクロ指標取得 =====
+
+
+def fetch_macro_data() -> dict:
+    """米10年債利回り・USD/JPY・金価格を取得"""
+    macro = {}
+
+    for ticker, name in MACRO_TICKERS.items():
+        try:
+            data = yf.Ticker(ticker).history(period="5d")
+            if len(data) >= 2:
+                current = round(data["Close"].iloc[-1], 2)
+                prev = round(data["Close"].iloc[-2], 2)
+                change = round((current / prev - 1) * 100, 2)
+                macro[ticker] = {
+                    "name": name,
+                    "current": current,
+                    "prev": prev,
+                    "change": change,
+                }
+            else:
+                logger.warning(f"{ticker}: マクロデータ不足")
+        except Exception as e:
+            logger.error(f"{ticker} マクロデータ取得失敗: {e}")
+
+    return macro
 
 
 # ===== スコアリング =====
 
 
-def calculate_score(report_data: dict, vix_data: dict | None) -> tuple[int, bool]:
+def calculate_score(
+    report_data: dict, vix_data: dict | None, macro_data: dict
+) -> tuple[int, bool]:
     """
     市場温度スコアとリスクフラグを算出。
-    VIXは独立して1回だけ評価する。
+    VIXは独立して1回だけ評価。マクロ指標も加味。
     """
     score = 50
     risk_flag = False
@@ -165,6 +221,27 @@ def calculate_score(report_data: dict, vix_data: dict | None) -> tuple[int, bool
         elif vix_change > 5:
             score -= 10
             risk_flag = True
+
+    # --- マクロ指標による調整 ---
+    # 米10年債利回りの急騰 → グロース株に逆風
+    tnx = macro_data.get("^TNX")
+    if tnx:
+        if tnx["change"] > 3:  # 利回り急騰
+            score -= 5
+        elif tnx["change"] < -3:  # 利回り急低下（グロースに追い風）
+            score += 3
+
+    # 円高ドル安の急進 → 日本からの投資に影響（参考指標）
+    usdjpy = macro_data.get("JPY=X")
+    if usdjpy:
+        if usdjpy["change"] < -1.5:  # 急速な円高
+            score -= 3
+
+    # 金価格急騰 → リスクオフシグナル
+    gold = macro_data.get("GC=F")
+    if gold:
+        if gold["change"] > 2:
+            score -= 3
 
     return int(clamp(score)), risk_flag
 
@@ -255,9 +332,7 @@ def distribute(group: list[str], total_weight: float, report_data: dict) -> dict
     return result
 
 
-def build_detailed_allocation(
-    allocation: dict, report_data: dict
-) -> dict:
+def build_detailed_allocation(allocation: dict, report_data: dict) -> dict:
     """銘柄別の詳細配分を毎回最新データで構築。"""
     detailed = {}
     detailed.update(
@@ -393,6 +468,7 @@ def generate_report(
     risk_flag: bool,
     report_data: dict,
     vix_data: dict | None,
+    macro_data: dict,
     translated_news: list[str],
     negative_count: int,
     allocation: dict,
@@ -407,73 +483,162 @@ def generate_report(
         lines.append("📌 今週は配分維持日です")
 
     lines.append("")
-    lines.append("===== AI市場プロレポート =====")
-    lines.append(f"日付: {datetime.date.today()}")
+    lines.append("=" * 40)
+    lines.append(f"📊 AI市場プロレポート | {datetime.date.today()}")
     lines.append(f"市場温度: {score} {temp}")
-    lines.append("")
+    lines.append("=" * 40)
 
-    # 銘柄テクニカル
+    # ============================
+    # マクロ環境サマリー（新セクション）
+    # ============================
+    lines.append("")
+    lines.append("■ マクロ環境")
+    lines.append("-" * 30)
+
+    if macro_data:
+        for ticker, m in macro_data.items():
+            sign = "+" if m["change"] >= 0 else ""
+            # 利回りは%表示、為替・金は価格表示
+            if ticker == "^TNX":
+                lines.append(
+                    f"  {m['name']}: {m['current']}%"
+                    f"  ({sign}{m['change']}%)"
+                    f"  {diff_arrow(m['current'], m['prev'])}"
+                )
+            else:
+                lines.append(
+                    f"  {m['name']}: {m['current']}"
+                    f"  ({sign}{m['change']}%)"
+                    f"  {diff_arrow(m['current'], m['prev'])}"
+                )
+
+        # マクロ影響の要約コメント
+        tnx = macro_data.get("^TNX")
+        usdjpy = macro_data.get("JPY=X")
+        gold = macro_data.get("GC=F")
+
+        warnings = []
+        if tnx and tnx["change"] > 3:
+            warnings.append("⚠ 金利急騰 → グロース株に逆風")
+        if tnx and tnx["change"] < -3:
+            warnings.append("✅ 金利低下 → グロース株に追い風")
+        if usdjpy and usdjpy["change"] < -1.5:
+            warnings.append("⚠ 急速な円高 → ドル建て資産目減り注意")
+        if usdjpy and usdjpy["change"] > 1.5:
+            warnings.append("✅ 円安進行 → ドル建て資産に追い風")
+        if gold and gold["change"] > 2:
+            warnings.append("⚠ 金価格急騰 → リスクオフの兆候")
+
+        if warnings:
+            lines.append("")
+            for w in warnings:
+                lines.append(f"  {w}")
+    else:
+        lines.append("  データ取得なし")
+
+    # ============================
+    # 銘柄テクニカル（diff付き）
+    # ============================
+    lines.append("")
+    lines.append("■ 銘柄テクニカル")
+    lines.append("-" * 30)
+
     all_tickers = {**tickers, VIX_TICKER: "VIX"}
     for ticker, name in all_tickers.items():
         d = report_data.get(ticker) if ticker != VIX_TICKER else vix_data
         if d is None:
             continue
-        lines.append(f"{name} ({ticker})")
-        lines.append(f"  前日比: {d['change']}%")
-        lines.append(f"  MA50: {d['ma50']}")
-        lines.append(f"  MA200: {d['ma200']}")
-        lines.append(f"  RSI: {d['rsi']}")
-        vol_str = f"{d['volume_ratio']}倍" if d['volume_ratio'] is not None else "N/A"
-        lines.append(f"  出来高倍率: {vol_str}")
+
+        lines.append(f"  {name} ({ticker})")
+
+        # 前日比 + 前日からの変化方向
+        change_str = f"{d['change']:+.2f}%"
+        if d.get("prev_change") is not None:
+            momentum = d["change"] - d["prev_change"]
+            if momentum > 0.5:
+                momentum_icon = "📈 加速"
+            elif momentum < -0.5:
+                momentum_icon = "📉 減速"
+            else:
+                momentum_icon = "➡ 横ばい"
+            lines.append(f"    前日比: {change_str}  (前日: {d['prev_change']:+.2f}%) {momentum_icon}")
+        else:
+            lines.append(f"    前日比: {change_str}")
+
+        lines.append(f"    MA50: {d['ma50']}  MA200: {d['ma200']}")
+
+        # RSI + 前日比較
+        rsi_str = f"{d['rsi']}"
+        if d.get("rsi_prev") is not None:
+            rsi_diff = d["rsi"] - d["rsi_prev"]
+            rsi_str += f"  ({diff_arrow(d['rsi'], d['rsi_prev'])})"
+        lines.append(f"    RSI: {rsi_str}")
+
+        vol_str = f"{d['volume_ratio']}倍" if d["volume_ratio"] is not None else "N/A"
+        lines.append(f"    出来高倍率: {vol_str}")
         lines.append("")
 
+    # ============================
     # ニュース
+    # ============================
     lines.append("■ AI関連最新ニュース")
+    lines.append("-" * 30)
     if translated_news:
         for n in translated_news:
-            lines.append(f"- {n}")
+            lines.append(f"  - {n}")
     else:
-        lines.append("- ニュースの取得なし")
+        lines.append("  - ニュースの取得なし")
 
     if negative_count >= 2:
         lines.append("")
-        lines.append("⚠ ネガティブニュース増加（市場警戒）")
+        lines.append("  ⚠ ネガティブニュース増加（市場警戒）")
 
     if risk_flag:
         lines.append("")
-        lines.append("⚠ 崩れモード発動")
+        lines.append("  ⚠ 崩れモード発動")
 
+    # ============================
     # 押し目候補
+    # ============================
     lines.append("")
     lines.append("■ 押し目候補")
+    lines.append("-" * 30)
     dip_found = False
     for ticker, d in report_data.items():
         if d["change"] < -4 and d["rsi"] < 35 and d["ma50"] > d["ma200"]:
-            lines.append(f"・{ticker} 押し目候補")
+            lines.append(f"  ✅ {ticker} (RSI: {d['rsi']}, 前日比: {d['change']}%)")
             dip_found = True
     if not dip_found:
-        lines.append("・該当なし")
+        lines.append("  該当なし")
 
+    # ============================
     # ポジション配分
+    # ============================
     lines.append("")
     lines.append("■ 推奨ポジション配分")
-    lines.append(f"現金: {allocation['cash']}%")
-    lines.append(f"半導体: {allocation['semiconductor']}%")
-    lines.append(f"AI大型株: {allocation['ai_large']}%")
-    lines.append(f"ディフェンシブ: {allocation['defensive']}%")
+    lines.append("-" * 30)
+    lines.append(f"  現金:          {allocation['cash']}%")
+    lines.append(f"  半導体:        {allocation['semiconductor']}%")
+    lines.append(f"  AI大型株:      {allocation['ai_large']}%")
+    lines.append(f"  ディフェンシブ: {allocation['defensive']}%")
 
     lines.append("")
     lines.append("■ 銘柄別詳細配分")
+    lines.append("-" * 30)
     for t, w in detailed_allocation.items():
-        lines.append(f"{t}: {w}%")
+        bar_len = int(w / 2)  # 簡易バーグラフ
+        bar = "█" * bar_len
+        lines.append(f"  {t:6s}: {w:5.1f}%  {bar}")
 
     return "\n".join(lines)
 
 
-# ===== メール送信 =====
+# ===== メール送信（HTML強化版） =====
 
 
-def send_email(report: str, score: int, temp: str, risk_flag: bool):
+def send_email(
+    report: str, score: int, temp: str, risk_flag: bool, macro_data: dict
+):
     gmail_user = os.getenv("GMAIL_ADDRESS")
     gmail_password = os.getenv("GMAIL_APP_PASSWORD")
 
@@ -481,16 +646,55 @@ def send_email(report: str, score: int, temp: str, risk_flag: bool):
         logger.error("Gmail認証情報が設定されていません")
         return
 
-    subject = "⚠ AI市場警戒アラート" if risk_flag else "Daily AI Stock Report"
+    subject = "⚠ AI市場警戒アラート" if risk_flag else "📊 Daily AI Market Report"
+
+    # マクロサマリー行をHTML用に生成
+    macro_rows = ""
+    for ticker, m in macro_data.items():
+        sign = "+" if m["change"] >= 0 else ""
+        color = "#e74c3c" if m["change"] < 0 else "#27ae60"
+        val = f"{m['current']}%" if ticker == "^TNX" else f"{m['current']}"
+        macro_rows += (
+            f'<tr><td>{m["name"]}</td>'
+            f'<td>{val}</td>'
+            f'<td style="color:{color};">{sign}{m["change"]}%</td></tr>'
+        )
+
+    # スコアバーの色
+    if score >= 65:
+        score_color = "#27ae60"
+    elif score >= 45:
+        score_color = "#f39c12"
+    else:
+        score_color = "#e74c3c"
 
     html = f"""
     <html>
-    <body style="font-family:Arial;">
-    <h2>📊 AI市場プロレポート</h2>
-    <p><b>日付:</b> {datetime.date.today()}</p>
-    <p><b>市場温度:</b> {score} {temp}</p>
-    <hr>
-    <pre>{report}</pre>
+    <body style="font-family:Arial,sans-serif;max-width:700px;margin:auto;padding:20px;">
+      <h2 style="border-bottom:2px solid #333;">📊 AI市場プロレポート</h2>
+      <p><b>日付:</b> {datetime.date.today()}</p>
+
+      <!-- スコアバー -->
+      <div style="margin:15px 0;">
+        <span style="font-size:18px;font-weight:bold;">市場温度: {score} {temp}</span>
+        <div style="background:#eee;border-radius:10px;height:20px;width:100%;margin-top:5px;">
+          <div style="background:{score_color};height:20px;border-radius:10px;width:{score}%;"></div>
+        </div>
+      </div>
+
+      <!-- マクロ指標テーブル -->
+      <h3>🌍 マクロ環境</h3>
+      <table style="border-collapse:collapse;width:100%;">
+        <tr style="background:#f5f5f5;">
+          <th style="padding:8px;text-align:left;">指標</th>
+          <th style="padding:8px;text-align:left;">現在値</th>
+          <th style="padding:8px;text-align:left;">前日比</th>
+        </tr>
+        {macro_rows}
+      </table>
+
+      <hr style="margin:20px 0;">
+      <pre style="font-size:13px;line-height:1.6;background:#f9f9f9;padding:15px;border-radius:8px;">{report}</pre>
     </body>
     </html>
     """
@@ -527,10 +731,13 @@ def main():
     # VIXは独立取得
     vix_data = fetch_technical_data(VIX_TICKER)
 
-    # 2. スコアリング
-    score, risk_flag = calculate_score(report_data, vix_data)
+    # 2. マクロ指標取得
+    macro_data = fetch_macro_data()
 
-    # 3. ニュース分析
+    # 3. スコアリング（マクロ指標も加味）
+    score, risk_flag = calculate_score(report_data, vix_data, macro_data)
+
+    # 4. ニュース分析
     news = get_ai_news()
     translated_news, negative_count = analyze_news(news)
 
@@ -540,41 +747,39 @@ def main():
     elif negative_count == 1:
         score = int(clamp(score - 5))
 
-    # 4. 温度判定
+    # 5. 温度判定
     temp = get_temperature_label(score)
 
-    # 5. ポジション配分
+    # 6. ポジション配分
     allocation = get_allocation(score, risk_flag)
 
-    # 6. リバランス判定
+    # 7. リバランス判定
     rebalance = is_rebalance_day()
 
-    # 7. 銘柄別詳細配分（毎日最新データで計算）
-    detailed_allocation = build_detailed_allocation(
-        allocation, report_data
-    )
+    # 8. 銘柄別詳細配分（毎日最新データで計算）
+    detailed_allocation = build_detailed_allocation(allocation, report_data)
 
-    # 8. NVDAブースト
+    # 9. NVDAブースト
     detailed_allocation = apply_nvda_boost(
         detailed_allocation, score, risk_flag, report_data
     )
 
-    # 9. VIX調整 + 正規化
+    # 10. VIX調整 + 正規化
     detailed_allocation = apply_vix_adjustment(
         detailed_allocation, vix_data, allocation
     )
 
-    # 10. レポート生成
+    # 11. レポート生成
     report = generate_report(
-        score, temp, risk_flag, report_data, vix_data,
+        score, temp, risk_flag, report_data, vix_data, macro_data,
         translated_news, negative_count,
         allocation, detailed_allocation, rebalance,
     )
 
     logger.info("\n" + report)
 
-    # 11. メール送信
-    send_email(report, score, temp, risk_flag)
+    # 12. メール送信
+    send_email(report, score, temp, risk_flag, macro_data)
 
     logger.info("===== 処理完了 =====")
 

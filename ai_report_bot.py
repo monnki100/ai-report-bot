@@ -53,6 +53,44 @@ negative_keywords = [
 semiconductor_stocks = ["NVDA", "AMD", "AVGO", "MU"]
 ai_large_stocks = ["MSFT", "AMZN", "GOOGL"]
 
+# 決算を監視する個別銘柄（インデックス・ETFは除外）
+EARNINGS_WATCH_TICKERS = ["NVDA", "MU", "AMD", "AVGO", "MSFT", "AMZN", "GOOGL"]
+
+# ===== FOMC日程（年初に更新、または自動取得失敗時のフォールバック） =====
+# https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm
+FOMC_DATES_2025 = [
+    datetime.date(2025, 1, 29),
+    datetime.date(2025, 3, 19),
+    datetime.date(2025, 5, 7),
+    datetime.date(2025, 6, 18),
+    datetime.date(2025, 7, 30),
+    datetime.date(2025, 9, 17),
+    datetime.date(2025, 10, 29),
+    datetime.date(2025, 12, 10),
+]
+FOMC_DATES_2026 = [
+    datetime.date(2026, 1, 28),
+    datetime.date(2026, 3, 18),
+    datetime.date(2026, 5, 6),
+    datetime.date(2026, 6, 17),
+    datetime.date(2026, 7, 29),
+    datetime.date(2026, 9, 16),
+    datetime.date(2026, 10, 28),
+    datetime.date(2026, 12, 16),
+]
+FOMC_DATES = FOMC_DATES_2025 + FOMC_DATES_2026
+
+# 主要経済指標の定例日程（毎月）
+# CPI: 通常第2週の火・水曜、雇用統計: 第1金曜
+# → 正確な日付はRSSニュースで補完するため、ここではFOMCのみ固定管理
+
+# 決算前の警戒日数
+EARNINGS_WARN_DAYS = 7
+# 決算後の結果注視日数
+EARNINGS_POST_DAYS = 2
+# FOMCの警戒日数
+FOMC_WARN_DAYS = 5
+
 # ===== ユーティリティ =====
 
 
@@ -88,6 +126,154 @@ def diff_arrow(current: float, previous: float) -> str:
         return "→ (変化なし)"
     arrow = "↑" if diff > 0 else "↓"
     return f"{arrow} {diff:+.2f}"
+
+
+# ===== 決算・イベントカレンダー =====
+
+
+def fetch_earnings_calendar() -> list[dict]:
+    """
+    yfinanceから各銘柄の次回決算日を取得。
+    返り値: [{"ticker": "NVDA", "name": "NVIDIA", "date": datetime.date, "days_until": int}, ...]
+    """
+    today = datetime.date.today()
+    earnings = []
+
+    for ticker in EARNINGS_WATCH_TICKERS:
+        name = tickers.get(ticker, ticker)
+        try:
+            stock = yf.Ticker(ticker)
+            cal = stock.calendar
+
+            if cal is None or cal.empty if isinstance(cal, pd.DataFrame) else not cal:
+                logger.info(f"{ticker}: 決算カレンダーなし")
+                continue
+
+            # yfinanceのcalendarはdict or DataFrameで返る
+            earnings_date = None
+
+            if isinstance(cal, dict):
+                # "Earnings Date" キーがリストの場合がある
+                ed = cal.get("Earnings Date")
+                if ed:
+                    if isinstance(ed, list) and len(ed) > 0:
+                        earnings_date = ed[0]
+                    elif isinstance(ed, (datetime.datetime, datetime.date)):
+                        earnings_date = ed
+            elif isinstance(cal, pd.DataFrame):
+                if "Earnings Date" in cal.columns:
+                    vals = cal["Earnings Date"].dropna()
+                    if len(vals) > 0:
+                        earnings_date = vals.iloc[0]
+                elif "Earnings Date" in cal.index:
+                    vals = cal.loc["Earnings Date"].dropna()
+                    if len(vals) > 0:
+                        earnings_date = vals.iloc[0]
+
+            if earnings_date is None:
+                continue
+
+            # datetime → date に変換
+            if isinstance(earnings_date, datetime.datetime):
+                earnings_date = earnings_date.date()
+            elif isinstance(earnings_date, pd.Timestamp):
+                earnings_date = earnings_date.date()
+
+            days_until = (earnings_date - today).days
+
+            earnings.append({
+                "ticker": ticker,
+                "name": name,
+                "date": earnings_date,
+                "days_until": days_until,
+            })
+
+        except Exception as e:
+            logger.warning(f"{ticker} 決算日取得失敗: {e}")
+
+    # 日付順にソート
+    earnings.sort(key=lambda x: x["date"])
+    return earnings
+
+
+def get_upcoming_fomc() -> list[dict]:
+    """今後のFOMC日程を取得（直近3回分）"""
+    today = datetime.date.today()
+    upcoming = []
+
+    for d in FOMC_DATES:
+        days_until = (d - today).days
+        if days_until >= -1:  # 前日まで含む（結果発表考慮）
+            upcoming.append({
+                "date": d,
+                "days_until": days_until,
+            })
+        if len(upcoming) >= 3:
+            break
+
+    return upcoming
+
+
+def build_event_alerts(
+    earnings: list[dict], fomc: list[dict]
+) -> tuple[list[str], int]:
+    """
+    イベントに基づくアラートメッセージとスコア調整値を生成。
+    返り値: (アラートメッセージリスト, スコア調整値)
+    """
+    alerts = []
+    score_adj = 0
+
+    # --- 決算アラート ---
+    for e in earnings:
+        ticker = e["ticker"]
+        days = e["days_until"]
+        date_str = e["date"].strftime("%m/%d")
+
+        if 0 < days <= EARNINGS_WARN_DAYS:
+            urgency = "🔴" if days <= 3 else "🟡"
+            alerts.append(
+                f"{urgency} {e['name']} ({ticker}) 決算まで{days}日 ({date_str})"
+            )
+            # 主力銘柄の決算直前はボラ上昇を考慮
+            if ticker in ("NVDA", "AMD") and days <= 3:
+                score_adj -= 3
+                alerts.append(f"   → {ticker} 決算直前: ポジション縮小推奨")
+
+        elif days == 0:
+            alerts.append(
+                f"🔔 {e['name']} ({ticker}) 本日決算発表！ ({date_str})"
+            )
+            if ticker in ("NVDA", "AMD"):
+                score_adj -= 5
+                alerts.append(f"   → {ticker} 決算当日: 高ボラティリティに警戒")
+
+        elif -EARNINGS_POST_DAYS <= days < 0:
+            alerts.append(
+                f"📋 {e['name']} ({ticker}) 決算発表済み ({date_str}) 結果注視"
+            )
+
+    # --- FOMCアラート ---
+    for f in fomc:
+        days = f["days_until"]
+        date_str = f["date"].strftime("%m/%d")
+
+        if 0 < days <= FOMC_WARN_DAYS:
+            urgency = "🔴" if days <= 2 else "🟡"
+            alerts.append(f"{urgency} FOMC まで{days}日 ({date_str})")
+            if days <= 2:
+                score_adj -= 3
+                alerts.append("   → FOMC直前: 様子見推奨")
+
+        elif days == 0:
+            alerts.append(f"🔔 本日FOMC発表！ ({date_str})")
+            score_adj -= 5
+            alerts.append("   → FOMC当日: 結果待ちでポジション縮小推奨")
+
+        elif days == -1:
+            alerts.append(f"📋 FOMC結果発表直後 ({date_str}) 市場反応を注視")
+
+    return alerts, score_adj
 
 
 # ===== テクニカルデータ取得 =====
@@ -223,21 +409,18 @@ def calculate_score(
             risk_flag = True
 
     # --- マクロ指標による調整 ---
-    # 米10年債利回りの急騰 → グロース株に逆風
     tnx = macro_data.get("^TNX")
     if tnx:
-        if tnx["change"] > 3:  # 利回り急騰
+        if tnx["change"] > 3:
             score -= 5
-        elif tnx["change"] < -3:  # 利回り急低下（グロースに追い風）
+        elif tnx["change"] < -3:
             score += 3
 
-    # 円高ドル安の急進 → 日本からの投資に影響（参考指標）
     usdjpy = macro_data.get("JPY=X")
     if usdjpy:
-        if usdjpy["change"] < -1.5:  # 急速な円高
+        if usdjpy["change"] < -1.5:
             score -= 3
 
-    # 金価格急騰 → リスクオフシグナル
     gold = macro_data.get("GC=F")
     if gold:
         if gold["change"] > 2:
@@ -474,6 +657,9 @@ def generate_report(
     allocation: dict,
     detailed_allocation: dict,
     rebalance: bool,
+    event_alerts: list[str],
+    earnings_calendar: list[dict],
+    fomc_upcoming: list[dict],
 ) -> str:
     lines = []
 
@@ -489,7 +675,61 @@ def generate_report(
     lines.append("=" * 40)
 
     # ============================
-    # マクロ環境サマリー（新セクション）
+    # イベントアラート（最上部に配置）
+    # ============================
+    if event_alerts:
+        lines.append("")
+        lines.append("■ イベントアラート")
+        lines.append("-" * 30)
+        for alert in event_alerts:
+            lines.append(f"  {alert}")
+
+    # ============================
+    # 決算カレンダー
+    # ============================
+    lines.append("")
+    lines.append("■ 決算カレンダー（今後30日）")
+    lines.append("-" * 30)
+
+    upcoming_earnings = [e for e in earnings_calendar if 0 <= e["days_until"] <= 30]
+    if upcoming_earnings:
+        for e in upcoming_earnings:
+            date_str = e["date"].strftime("%m/%d (%a)")
+            days = e["days_until"]
+            if days == 0:
+                tag = "⚡本日"
+            elif days <= 3:
+                tag = f"🔴 {days}日後"
+            elif days <= 7:
+                tag = f"🟡 {days}日後"
+            else:
+                tag = f"   {days}日後"
+            lines.append(f"  {tag}  {e['name']} ({e['ticker']})  {date_str}")
+    else:
+        lines.append("  今後30日以内の決算予定なし")
+
+    # FOMC日程
+    lines.append("")
+    lines.append("■ FOMC日程")
+    lines.append("-" * 30)
+    if fomc_upcoming:
+        for f in fomc_upcoming:
+            date_str = f["date"].strftime("%m/%d (%a)")
+            days = f["days_until"]
+            if days == 0:
+                tag = "⚡本日"
+            elif days <= 3:
+                tag = f"🔴 {days}日後"
+            elif days <= 7:
+                tag = f"🟡 {days}日後"
+            else:
+                tag = f"   {days}日後"
+            lines.append(f"  {tag}  FOMC  {date_str}")
+    else:
+        lines.append("  直近のFOMC日程なし")
+
+    # ============================
+    # マクロ環境サマリー
     # ============================
     lines.append("")
     lines.append("■ マクロ環境")
@@ -498,7 +738,6 @@ def generate_report(
     if macro_data:
         for ticker, m in macro_data.items():
             sign = "+" if m["change"] >= 0 else ""
-            # 利回りは%表示、為替・金は価格表示
             if ticker == "^TNX":
                 lines.append(
                     f"  {m['name']}: {m['current']}%"
@@ -549,7 +788,14 @@ def generate_report(
         if d is None:
             continue
 
-        lines.append(f"  {name} ({ticker})")
+        # 決算接近マーカー
+        earnings_mark = ""
+        for e in earnings_calendar:
+            if e["ticker"] == ticker and 0 <= e["days_until"] <= EARNINGS_WARN_DAYS:
+                earnings_mark = f" 📅決算{e['days_until']}日後" if e["days_until"] > 0 else " ⚡決算本日"
+                break
+
+        lines.append(f"  {name} ({ticker}){earnings_mark}")
 
         # 前日比 + 前日からの変化方向
         change_str = f"{d['change']:+.2f}%"
@@ -570,7 +816,6 @@ def generate_report(
         # RSI + 前日比較
         rsi_str = f"{d['rsi']}"
         if d.get("rsi_prev") is not None:
-            rsi_diff = d["rsi"] - d["rsi_prev"]
             rsi_str += f"  ({diff_arrow(d['rsi'], d['rsi_prev'])})"
         lines.append(f"    RSI: {rsi_str}")
 
@@ -626,7 +871,7 @@ def generate_report(
     lines.append("■ 銘柄別詳細配分")
     lines.append("-" * 30)
     for t, w in detailed_allocation.items():
-        bar_len = int(w / 2)  # 簡易バーグラフ
+        bar_len = int(w / 2)
         bar = "█" * bar_len
         lines.append(f"  {t:6s}: {w:5.1f}%  {bar}")
 
@@ -637,7 +882,12 @@ def generate_report(
 
 
 def send_email(
-    report: str, score: int, temp: str, risk_flag: bool, macro_data: dict
+    report: str,
+    score: int,
+    temp: str,
+    risk_flag: bool,
+    macro_data: dict,
+    event_alerts: list[str],
 ):
     gmail_user = os.getenv("GMAIL_ADDRESS")
     gmail_password = os.getenv("GMAIL_APP_PASSWORD")
@@ -646,7 +896,13 @@ def send_email(
         logger.error("Gmail認証情報が設定されていません")
         return
 
-    subject = "⚠ AI市場警戒アラート" if risk_flag else "📊 Daily AI Market Report"
+    # 件名にイベント警告を含める
+    if event_alerts and any("決算まで" in a and "🔴" in a for a in event_alerts):
+        subject = "📅⚠ 決算接近アラート + AI市場レポート"
+    elif risk_flag:
+        subject = "⚠ AI市場警戒アラート"
+    else:
+        subject = "📊 Daily AI Market Report"
 
     # マクロサマリー行をHTML用に生成
     macro_rows = ""
@@ -655,10 +911,23 @@ def send_email(
         color = "#e74c3c" if m["change"] < 0 else "#27ae60"
         val = f"{m['current']}%" if ticker == "^TNX" else f"{m['current']}"
         macro_rows += (
-            f'<tr><td>{m["name"]}</td>'
-            f'<td>{val}</td>'
-            f'<td style="color:{color};">{sign}{m["change"]}%</td></tr>'
+            f'<tr><td style="padding:6px;">{m["name"]}</td>'
+            f'<td style="padding:6px;">{val}</td>'
+            f'<td style="padding:6px;color:{color};">{sign}{m["change"]}%</td></tr>'
         )
+
+    # イベントアラートHTML
+    event_html = ""
+    if event_alerts:
+        alert_items = "".join(
+            f'<li style="margin:4px 0;">{a}</li>' for a in event_alerts
+        )
+        event_html = f"""
+        <div style="background:#fff3cd;border:1px solid #ffc107;border-radius:8px;padding:12px;margin:15px 0;">
+          <h3 style="margin:0 0 8px 0;">📅 イベントアラート</h3>
+          <ul style="margin:0;padding-left:20px;">{alert_items}</ul>
+        </div>
+        """
 
     # スコアバーの色
     if score >= 65:
@@ -681,6 +950,9 @@ def send_email(
           <div style="background:{score_color};height:20px;border-radius:10px;width:{score}%;"></div>
         </div>
       </div>
+
+      <!-- イベントアラート -->
+      {event_html}
 
       <!-- マクロ指標テーブル -->
       <h3>🌍 マクロ環境</h3>
@@ -734,10 +1006,20 @@ def main():
     # 2. マクロ指標取得
     macro_data = fetch_macro_data()
 
-    # 3. スコアリング（マクロ指標も加味）
+    # 3. 決算・イベントカレンダー取得
+    earnings_calendar = fetch_earnings_calendar()
+    fomc_upcoming = get_upcoming_fomc()
+    event_alerts, event_score_adj = build_event_alerts(
+        earnings_calendar, fomc_upcoming
+    )
+
+    # 4. スコアリング（マクロ指標も加味）
     score, risk_flag = calculate_score(report_data, vix_data, macro_data)
 
-    # 4. ニュース分析
+    # 5. イベントによるスコア調整
+    score = int(clamp(score + event_score_adj))
+
+    # 6. ニュース分析
     news = get_ai_news()
     translated_news, negative_count = analyze_news(news)
 
@@ -747,39 +1029,40 @@ def main():
     elif negative_count == 1:
         score = int(clamp(score - 5))
 
-    # 5. 温度判定
+    # 7. 温度判定
     temp = get_temperature_label(score)
 
-    # 6. ポジション配分
+    # 8. ポジション配分
     allocation = get_allocation(score, risk_flag)
 
-    # 7. リバランス判定
+    # 9. リバランス判定
     rebalance = is_rebalance_day()
 
-    # 8. 銘柄別詳細配分（毎日最新データで計算）
+    # 10. 銘柄別詳細配分（毎日最新データで計算）
     detailed_allocation = build_detailed_allocation(allocation, report_data)
 
-    # 9. NVDAブースト
+    # 11. NVDAブースト
     detailed_allocation = apply_nvda_boost(
         detailed_allocation, score, risk_flag, report_data
     )
 
-    # 10. VIX調整 + 正規化
+    # 12. VIX調整 + 正規化
     detailed_allocation = apply_vix_adjustment(
         detailed_allocation, vix_data, allocation
     )
 
-    # 11. レポート生成
+    # 13. レポート生成
     report = generate_report(
         score, temp, risk_flag, report_data, vix_data, macro_data,
         translated_news, negative_count,
         allocation, detailed_allocation, rebalance,
+        event_alerts, earnings_calendar, fomc_upcoming,
     )
 
     logger.info("\n" + report)
 
-    # 12. メール送信
-    send_email(report, score, temp, risk_flag, macro_data)
+    # 14. メール送信
+    send_email(report, score, temp, risk_flag, macro_data, event_alerts)
 
     logger.info("===== 処理完了 =====")
 

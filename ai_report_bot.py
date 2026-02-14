@@ -56,8 +56,7 @@ ai_large_stocks = ["MSFT", "AMZN", "GOOGL"]
 # 決算を監視する個別銘柄（インデックス・ETFは除外）
 EARNINGS_WATCH_TICKERS = ["NVDA", "MU", "AMD", "AVGO", "MSFT", "AMZN", "GOOGL"]
 
-# ===== FOMC日程（年初に更新、または自動取得失敗時のフォールバック） =====
-# https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm
+# ===== FOMC日程 =====
 FOMC_DATES_2025 = [
     datetime.date(2025, 1, 29),
     datetime.date(2025, 3, 19),
@@ -80,15 +79,8 @@ FOMC_DATES_2026 = [
 ]
 FOMC_DATES = FOMC_DATES_2025 + FOMC_DATES_2026
 
-# 主要経済指標の定例日程（毎月）
-# CPI: 通常第2週の火・水曜、雇用統計: 第1金曜
-# → 正確な日付はRSSニュースで補完するため、ここではFOMCのみ固定管理
-
-# 決算前の警戒日数
 EARNINGS_WARN_DAYS = 7
-# 決算後の結果注視日数
 EARNINGS_POST_DAYS = 2
-# FOMCの警戒日数
 FOMC_WARN_DAYS = 5
 
 # ===== ユーティリティ =====
@@ -115,12 +107,10 @@ def calculate_rsi(series: pd.Series, period: int = 14) -> pd.Series:
 
 
 def clamp(value: float, low: float = 0, high: float = 100) -> float:
-    """値を範囲内にクランプ"""
     return max(low, min(high, value))
 
 
 def diff_arrow(current: float, previous: float) -> str:
-    """前日比の矢印表示を生成"""
     diff = current - previous
     if abs(diff) < 0.01:
         return "→ (変化なし)"
@@ -132,10 +122,6 @@ def diff_arrow(current: float, previous: float) -> str:
 
 
 def fetch_earnings_calendar() -> list[dict]:
-    """
-    yfinanceから各銘柄の次回決算日を取得。
-    返り値: [{"ticker": "NVDA", "name": "NVIDIA", "date": datetime.date, "days_until": int}, ...]
-    """
     today = datetime.date.today()
     earnings = []
 
@@ -145,15 +131,12 @@ def fetch_earnings_calendar() -> list[dict]:
             stock = yf.Ticker(ticker)
             cal = stock.calendar
 
-            if cal is None or cal.empty if isinstance(cal, pd.DataFrame) else not cal:
-                logger.info(f"{ticker}: 決算カレンダーなし")
+            if cal is None or (isinstance(cal, pd.DataFrame) and cal.empty):
                 continue
 
-            # yfinanceのcalendarはdict or DataFrameで返る
             earnings_date = None
 
             if isinstance(cal, dict):
-                # "Earnings Date" キーがリストの場合がある
                 ed = cal.get("Earnings Date")
                 if ed:
                     if isinstance(ed, list) and len(ed) > 0:
@@ -173,14 +156,10 @@ def fetch_earnings_calendar() -> list[dict]:
             if earnings_date is None:
                 continue
 
-            # datetime → date に変換
-            if isinstance(earnings_date, datetime.datetime):
-                earnings_date = earnings_date.date()
-            elif isinstance(earnings_date, pd.Timestamp):
+            if isinstance(earnings_date, (datetime.datetime, pd.Timestamp)):
                 earnings_date = earnings_date.date()
 
             days_until = (earnings_date - today).days
-
             earnings.append({
                 "ticker": ticker,
                 "name": name,
@@ -191,40 +170,28 @@ def fetch_earnings_calendar() -> list[dict]:
         except Exception as e:
             logger.warning(f"{ticker} 決算日取得失敗: {e}")
 
-    # 日付順にソート
     earnings.sort(key=lambda x: x["date"])
     return earnings
 
 
 def get_upcoming_fomc() -> list[dict]:
-    """今後のFOMC日程を取得（直近3回分）"""
     today = datetime.date.today()
     upcoming = []
-
     for d in FOMC_DATES:
         days_until = (d - today).days
-        if days_until >= -1:  # 前日まで含む（結果発表考慮）
-            upcoming.append({
-                "date": d,
-                "days_until": days_until,
-            })
+        if days_until >= -1:
+            upcoming.append({"date": d, "days_until": days_until})
         if len(upcoming) >= 3:
             break
-
     return upcoming
 
 
 def build_event_alerts(
     earnings: list[dict], fomc: list[dict]
 ) -> tuple[list[str], int]:
-    """
-    イベントに基づくアラートメッセージとスコア調整値を生成。
-    返り値: (アラートメッセージリスト, スコア調整値)
-    """
     alerts = []
     score_adj = 0
 
-    # --- 決算アラート ---
     for e in earnings:
         ticker = e["ticker"]
         days = e["days_until"]
@@ -235,11 +202,9 @@ def build_event_alerts(
             alerts.append(
                 f"{urgency} {e['name']} ({ticker}) 決算まで{days}日 ({date_str})"
             )
-            # 主力銘柄の決算直前はボラ上昇を考慮
             if ticker in ("NVDA", "AMD") and days <= 3:
                 score_adj -= 3
                 alerts.append(f"   → {ticker} 決算直前: ポジション縮小推奨")
-
         elif days == 0:
             alerts.append(
                 f"🔔 {e['name']} ({ticker}) 本日決算発表！ ({date_str})"
@@ -247,13 +212,11 @@ def build_event_alerts(
             if ticker in ("NVDA", "AMD"):
                 score_adj -= 5
                 alerts.append(f"   → {ticker} 決算当日: 高ボラティリティに警戒")
-
         elif -EARNINGS_POST_DAYS <= days < 0:
             alerts.append(
                 f"📋 {e['name']} ({ticker}) 決算発表済み ({date_str}) 結果注視"
             )
 
-    # --- FOMCアラート ---
     for f in fomc:
         days = f["days_until"]
         date_str = f["date"].strftime("%m/%d")
@@ -264,12 +227,10 @@ def build_event_alerts(
             if days <= 2:
                 score_adj -= 3
                 alerts.append("   → FOMC直前: 様子見推奨")
-
         elif days == 0:
             alerts.append(f"🔔 本日FOMC発表！ ({date_str})")
             score_adj -= 5
             alerts.append("   → FOMC当日: 結果待ちでポジション縮小推奨")
-
         elif days == -1:
             alerts.append(f"📋 FOMC結果発表直後 ({date_str}) 市場反応を注視")
 
@@ -280,7 +241,6 @@ def build_event_alerts(
 
 
 def fetch_technical_data(ticker_symbol: str) -> dict | None:
-    """1銘柄のテクニカル指標を取得。データ不足時はNone。"""
     try:
         stock = yf.Ticker(ticker_symbol)
         hist = stock.history(period="1y")
@@ -296,7 +256,6 @@ def fetch_technical_data(ticker_symbol: str) -> dict | None:
     current = close.iloc[-1]
     prev = close.iloc[-2]
 
-    # 2日前（前日比較用）
     prev2 = close.iloc[-3] if len(close) >= 3 else None
     prev_change = round((prev / prev2 - 1) * 100, 2) if prev2 else None
 
@@ -304,7 +263,6 @@ def fetch_technical_data(ticker_symbol: str) -> dict | None:
     rsi_today = round(rsi_series.iloc[-1], 2)
     rsi_prev = round(rsi_series.iloc[-2], 2) if len(rsi_series) >= 2 else None
 
-    # 出来高倍率（VIX等、出来高がない銘柄はN/A扱い）
     vol_avg = hist["Volume"].rolling(20).mean().iloc[-1]
     vol_current = hist["Volume"].iloc[-1]
     if pd.notna(vol_avg) and vol_avg > 0 and pd.notna(vol_current):
@@ -328,9 +286,7 @@ def fetch_technical_data(ticker_symbol: str) -> dict | None:
 
 
 def fetch_macro_data() -> dict:
-    """米10年債利回り・USD/JPY・金価格を取得"""
     macro = {}
-
     for ticker, name in MACRO_TICKERS.items():
         try:
             data = yf.Ticker(ticker).history(period="5d")
@@ -344,12 +300,170 @@ def fetch_macro_data() -> dict:
                     "prev": prev,
                     "change": change,
                 }
-            else:
-                logger.warning(f"{ticker}: マクロデータ不足")
         except Exception as e:
             logger.error(f"{ticker} マクロデータ取得失敗: {e}")
-
     return macro
+
+
+# ===== 週次サマリー =====
+
+
+def fetch_weekly_performance() -> dict:
+    """
+    各銘柄の週間パフォーマンスを取得。
+    5営業日分のデータから週初→週末の変化率を計算。
+    """
+    weekly = {}
+
+    all_watch = list(tickers.keys()) + [VIX_TICKER]
+
+    for ticker in all_watch:
+        try:
+            hist = yf.Ticker(ticker).history(period="5d")
+            if len(hist) >= 2:
+                week_open = hist["Close"].iloc[0]
+                week_close = hist["Close"].iloc[-1]
+                week_high = hist["High"].max()
+                week_low = hist["Low"].min()
+                week_change = round((week_close / week_open - 1) * 100, 2)
+                weekly[ticker] = {
+                    "open": round(week_open, 2),
+                    "close": round(week_close, 2),
+                    "high": round(week_high, 2),
+                    "low": round(week_low, 2),
+                    "change": week_change,
+                }
+        except Exception as e:
+            logger.warning(f"{ticker} 週次データ取得失敗: {e}")
+
+    return weekly
+
+
+def generate_weekly_summary(
+    weekly: dict, score: int, temp: str, earnings_calendar: list[dict]
+) -> str:
+    """金曜日に追加される週次サマリーセクションを生成"""
+    lines = []
+    lines.append("")
+    lines.append("=" * 40)
+    lines.append("📈 週次サマリー")
+    lines.append("=" * 40)
+
+    # --- 週間パフォーマンスランキング ---
+    lines.append("")
+    lines.append("■ 週間パフォーマンス")
+    lines.append("-" * 30)
+
+    # 個別銘柄のみ（インデックス・ETFは別セクション）
+    stock_tickers = [t for t in weekly if not t.startswith("^") and t != "SOXX"]
+    index_tickers = [t for t in weekly if t.startswith("^") or t == "SOXX"]
+
+    # 個別銘柄を週間変化率でソート
+    sorted_stocks = sorted(
+        stock_tickers, key=lambda t: weekly[t]["change"], reverse=True
+    )
+
+    lines.append("  [個別銘柄]")
+    for rank, ticker in enumerate(sorted_stocks, 1):
+        w = weekly[ticker]
+        name = tickers.get(ticker, ticker)
+        sign = "+" if w["change"] >= 0 else ""
+        # 棒グラフ（正負対応）
+        bar_len = min(abs(int(w["change"])), 20)
+        if w["change"] >= 0:
+            bar = "🟩" * bar_len
+        else:
+            bar = "🟥" * bar_len
+        lines.append(
+            f"  {rank}. {name:10s} {sign}{w['change']:6.2f}%  {bar}"
+        )
+        lines.append(
+            f"     始値: {w['open']}  終値: {w['close']}"
+            f"  高値: {w['high']}  安値: {w['low']}"
+        )
+
+    lines.append("")
+    lines.append("  [指数・ETF]")
+    for ticker in index_tickers:
+        if ticker not in weekly:
+            continue
+        w = weekly[ticker]
+        name = tickers.get(ticker, "VIX" if ticker == VIX_TICKER else ticker)
+        sign = "+" if w["change"] >= 0 else ""
+        lines.append(f"  {name:10s} {sign}{w['change']:6.2f}%  ({w['open']} → {w['close']})")
+
+    # --- 週間ベスト/ワースト ---
+    if sorted_stocks:
+        best = sorted_stocks[0]
+        worst = sorted_stocks[-1]
+        lines.append("")
+        lines.append("■ 週間ハイライト")
+        lines.append("-" * 30)
+        lines.append(
+            f"  🏆 ベスト:  {tickers.get(best, best)} ({best})"
+            f"  {weekly[best]['change']:+.2f}%"
+        )
+        lines.append(
+            f"  📉 ワースト: {tickers.get(worst, worst)} ({worst})"
+            f"  {weekly[worst]['change']:+.2f}%"
+        )
+
+    # --- 来週の注目イベント ---
+    lines.append("")
+    lines.append("■ 来週の注目イベント")
+    lines.append("-" * 30)
+
+    today = datetime.date.today()
+    next_week_events = []
+
+    # 決算（7〜14日後）
+    for e in earnings_calendar:
+        if 1 <= e["days_until"] <= 14:
+            next_week_events.append(
+                f"  📅 {e['name']} ({e['ticker']}) 決算"
+                f"  {e['date'].strftime('%m/%d (%a)')}"
+                f"  ({e['days_until']}日後)"
+            )
+
+    # FOMC（7〜14日後）
+    for d in FOMC_DATES:
+        days_until = (d - today).days
+        if 1 <= days_until <= 14:
+            next_week_events.append(
+                f"  🏛 FOMC  {d.strftime('%m/%d (%a)')}  ({days_until}日後)"
+            )
+
+    if next_week_events:
+        for ev in next_week_events:
+            lines.append(ev)
+    else:
+        lines.append("  特になし")
+
+    # --- 週間総評 ---
+    lines.append("")
+    lines.append("■ 週間総評")
+    lines.append("-" * 30)
+
+    # 全銘柄の平均週間変化
+    if stock_tickers:
+        avg_change = np.mean([weekly[t]["change"] for t in stock_tickers])
+        positive_count = sum(1 for t in stock_tickers if weekly[t]["change"] > 0)
+        total = len(stock_tickers)
+
+        if avg_change > 2:
+            verdict = "📈 強い上昇の1週間。モメンタムの持続性に注目。"
+        elif avg_change > 0:
+            verdict = "➡ 小幅上昇。方向感の確認が必要。"
+        elif avg_change > -2:
+            verdict = "➡ 小幅下落。押し目形成の可能性も。"
+        else:
+            verdict = "📉 大幅下落の1週間。リスク管理の徹底を。"
+
+        lines.append(f"  監視銘柄平均: {avg_change:+.2f}%  ({positive_count}/{total}銘柄が上昇)")
+        lines.append(f"  {verdict}")
+        lines.append(f"  来週の市場温度見通し: {score} {temp}")
+
+    return "\n".join(lines)
 
 
 # ===== スコアリング =====
@@ -358,18 +472,12 @@ def fetch_macro_data() -> dict:
 def calculate_score(
     report_data: dict, vix_data: dict | None, macro_data: dict
 ) -> tuple[int, bool]:
-    """
-    市場温度スコアとリスクフラグを算出。
-    VIXは独立して1回だけ評価。マクロ指標も加味。
-    """
     score = 50
     risk_flag = False
 
-    # --- 個別銘柄スコアリング ---
     for ticker, d in report_data.items():
         change = d["change"]
 
-        # 半導体主力
         if ticker in ("NVDA", "AMD"):
             if change > 2:
                 score += 5
@@ -380,14 +488,12 @@ def calculate_score(
             if d["rsi"] > 70:
                 score -= 3
 
-        # S&P500
         if ticker == "^GSPC":
             if change > 1:
                 score += 5
             if change < -1:
                 score -= 5
 
-    # --- 長期トレンド判定 ---
     soxx = report_data.get("SOXX")
     if soxx and soxx["current"] < soxx["ma200"]:
         score -= 15
@@ -398,7 +504,6 @@ def calculate_score(
         score -= 10
         risk_flag = True
 
-    # --- VIX判定（1回のみ） ---
     if vix_data:
         vix_change = vix_data["change"]
         if vix_change > 10:
@@ -408,7 +513,6 @@ def calculate_score(
             score -= 10
             risk_flag = True
 
-    # --- マクロ指標による調整 ---
     tnx = macro_data.get("^TNX")
     if tnx:
         if tnx["change"] > 3:
@@ -451,7 +555,6 @@ def get_temperature_label(score: int) -> str:
 def get_allocation(score: int, risk_flag: bool) -> dict:
     if risk_flag:
         return {"cash": 70, "semiconductor": 5, "ai_large": 5, "defensive": 20}
-
     if score >= 80:
         return {"cash": 10, "semiconductor": 40, "ai_large": 40, "defensive": 10}
     elif score >= 65:
@@ -468,18 +571,14 @@ def get_allocation(score: int, risk_flag: bool) -> dict:
 
 
 def distribute(group: list[str], total_weight: float, report_data: dict) -> dict:
-    """グループ内銘柄をトレンド・RSIに基づいて配分。"""
-
     strong, normal, reduced = [], [], []
 
     for ticker in group:
         d = report_data.get(ticker)
         if d is None:
             continue
-
         trend_ok = d["ma50"] > d["ma200"]
         rsi = d["rsi"]
-
         if d["change"] > 2 and trend_ok and 40 <= rsi <= 65:
             strong.append(ticker)
         elif rsi > 70:
@@ -487,7 +586,6 @@ def distribute(group: list[str], total_weight: float, report_data: dict) -> dict
         else:
             normal.append(ticker)
 
-    # 全て空なら均等配分にフォールバック
     active = [t for t in group if t in report_data]
     if not active:
         return {}
@@ -495,7 +593,6 @@ def distribute(group: list[str], total_weight: float, report_data: dict) -> dict
         per = round(total_weight / len(active), 1)
         return {t: per for t in active}
 
-    # 重み配分
     if strong:
         weights = {"strong": 0.6, "normal": 0.3, "reduced": 0.1}
     else:
@@ -503,20 +600,16 @@ def distribute(group: list[str], total_weight: float, report_data: dict) -> dict
 
     result = {}
     for bucket, tickers_list in [
-        ("strong", strong),
-        ("normal", normal),
-        ("reduced", reduced),
+        ("strong", strong), ("normal", normal), ("reduced", reduced),
     ]:
         if tickers_list:
             per = round(total_weight * weights[bucket] / len(tickers_list), 1)
             for t in tickers_list:
                 result[t] = per
-
     return result
 
 
 def build_detailed_allocation(allocation: dict, report_data: dict) -> dict:
-    """銘柄別の詳細配分を毎回最新データで構築。"""
     detailed = {}
     detailed.update(
         distribute(semiconductor_stocks, allocation["semiconductor"], report_data)
@@ -535,7 +628,6 @@ def apply_nvda_boost(
 ) -> dict:
     if "NVDA" not in detailed:
         return detailed
-
     boost = 0
     if score >= 65:
         boost += 5
@@ -543,7 +635,6 @@ def apply_nvda_boost(
         boost -= 5
     if "NVDA" in report_data and report_data["NVDA"]["rsi"] < 35:
         boost += 3
-
     detailed["NVDA"] = max(0, detailed["NVDA"] + boost)
     return detailed
 
@@ -555,7 +646,6 @@ def apply_vix_adjustment(
     detailed: dict, vix_data: dict | None, allocation: dict
 ) -> dict:
     vix_change = vix_data["change"] if vix_data else 0
-
     vol_factor = 1.0
     if vix_change > 5:
         vol_factor = 0.8
@@ -565,31 +655,61 @@ def apply_vix_adjustment(
     for t in detailed:
         detailed[t] = round(detailed[t] * vol_factor, 1)
 
-    # 正規化
     total_weight = sum(detailed.values())
     target_total = allocation["semiconductor"] + allocation["ai_large"]
-
     if total_weight > 0:
         scale = target_total / total_weight
         for t in detailed:
             detailed[t] = round(detailed[t] * scale, 1)
-
     return detailed
 
 
-# ===== ニュース取得（Google News RSS） =====
-
-GOOGLE_NEWS_RSS_QUERIES = [
-    "AI semiconductor",
-    "NVIDIA AMD stock",
-]
+# ===== ニュース取得（NewsAPI優先 → Google News RSSフォールバック） =====
 
 
-def get_ai_news() -> list[str]:
-    """Google News RSSから最新ニュースタイトルを取得（APIキー不要）"""
+def get_ai_news_from_newsapi() -> list[str]:
+    """NewsAPI (everythingエンドポイント) からニュース取得"""
+    api_key = os.getenv("NEWS_API_KEY")
+    if not api_key:
+        logger.info("NEWS_API_KEY 未設定、スキップ")
+        return []
+
+    # 過去3日分を取得（無料プランの制限内）
+    from_date = (datetime.date.today() - datetime.timedelta(days=3)).isoformat()
+
+    url = (
+        "https://newsapi.org/v2/everything?"
+        "q=(AI OR semiconductor) AND (NVIDIA OR AMD OR Micron OR Broadcom)&"
+        f"from={from_date}&"
+        "language=en&sortBy=publishedAt&pageSize=5&"
+        f"apiKey={api_key}"
+    )
+    try:
+        r = requests.get(url, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+
+        if data.get("status") != "ok":
+            logger.warning(f"NewsAPI応答エラー: {data.get('message', 'unknown')}")
+            return []
+
+        titles = [
+            a["title"] for a in data.get("articles", [])
+            if a.get("title") and a["title"] != "[Removed]"
+        ]
+        return titles[:5]
+
+    except Exception as e:
+        logger.warning(f"NewsAPI取得失敗: {e}")
+        return []
+
+
+def get_ai_news_from_rss() -> list[str]:
+    """Google News RSSからフォールバック取得"""
+    queries = ["AI semiconductor", "NVIDIA AMD stock"]
     titles = []
 
-    for query in GOOGLE_NEWS_RSS_QUERIES:
+    for query in queries:
         url = (
             "https://news.google.com/rss/search?"
             f"q={query.replace(' ', '+')}&hl=en-US&gl=US&ceid=US:en"
@@ -598,7 +718,6 @@ def get_ai_news() -> list[str]:
             r = requests.get(url, timeout=10)
             r.raise_for_status()
             root = ET.fromstring(r.content)
-
             for item in root.findall(".//item")[:3]:
                 title_el = item.find("title")
                 if title_el is not None and title_el.text:
@@ -606,7 +725,6 @@ def get_ai_news() -> list[str]:
         except Exception as e:
             logger.error(f"Google News RSS取得失敗 ({query}): {e}")
 
-    # 重複除去して最大5件
     seen = set()
     unique = []
     for t in titles:
@@ -615,22 +733,34 @@ def get_ai_news() -> list[str]:
             unique.append(t)
         if len(unique) >= 5:
             break
-
     return unique
 
 
+def get_ai_news() -> list[str]:
+    """NewsAPIを優先し、失敗時はGoogle News RSSにフォールバック"""
+    news = get_ai_news_from_newsapi()
+    if news:
+        logger.info(f"NewsAPIから{len(news)}件取得")
+        return news
+
+    logger.info("NewsAPI失敗、Google News RSSにフォールバック")
+    news = get_ai_news_from_rss()
+    if news:
+        logger.info(f"Google News RSSから{len(news)}件取得")
+    else:
+        logger.warning("ニュース取得: 全ソース失敗")
+    return news
+
+
 def analyze_news(news: list[str]) -> tuple[list[str], int]:
-    """ニュースを翻訳し、ネガティブキーワードをカウント。"""
     translated = []
     negative_count = 0
-
     for title in news:
         lower = title.lower()
         for word in negative_keywords:
             if word in lower:
                 negative_count += 1
         translated.append(translate_to_japanese(title))
-
     return translated, negative_count
 
 
@@ -638,8 +768,7 @@ def analyze_news(news: list[str]) -> tuple[list[str], int]:
 
 
 def is_rebalance_day() -> bool:
-    """金曜日（市場終了後）にリバランス判定"""
-    return datetime.date.today().weekday() == 4  # 4 = 金曜日
+    return datetime.date.today().weekday() == 4  # 金曜日
 
 
 # ===== レポート生成 =====
@@ -674,9 +803,7 @@ def generate_report(
     lines.append(f"市場温度: {score} {temp}")
     lines.append("=" * 40)
 
-    # ============================
-    # イベントアラート（最上部に配置）
-    # ============================
+    # イベントアラート
     if event_alerts:
         lines.append("")
         lines.append("■ イベントアラート")
@@ -684,13 +811,10 @@ def generate_report(
         for alert in event_alerts:
             lines.append(f"  {alert}")
 
-    # ============================
     # 決算カレンダー
-    # ============================
     lines.append("")
     lines.append("■ 決算カレンダー（今後30日）")
     lines.append("-" * 30)
-
     upcoming_earnings = [e for e in earnings_calendar if 0 <= e["days_until"] <= 30]
     if upcoming_earnings:
         for e in upcoming_earnings:
@@ -728,13 +852,10 @@ def generate_report(
     else:
         lines.append("  直近のFOMC日程なし")
 
-    # ============================
-    # マクロ環境サマリー
-    # ============================
+    # マクロ環境
     lines.append("")
     lines.append("■ マクロ環境")
     lines.append("-" * 30)
-
     if macro_data:
         for ticker, m in macro_data.items():
             sign = "+" if m["change"] >= 0 else ""
@@ -751,12 +872,10 @@ def generate_report(
                     f"  {diff_arrow(m['current'], m['prev'])}"
                 )
 
-        # マクロ影響の要約コメント
+        warnings = []
         tnx = macro_data.get("^TNX")
         usdjpy = macro_data.get("JPY=X")
         gold = macro_data.get("GC=F")
-
-        warnings = []
         if tnx and tnx["change"] > 3:
             warnings.append("⚠ 金利急騰 → グロース株に逆風")
         if tnx and tnx["change"] < -3:
@@ -767,7 +886,6 @@ def generate_report(
             warnings.append("✅ 円安進行 → ドル建て資産に追い風")
         if gold and gold["change"] > 2:
             warnings.append("⚠ 金価格急騰 → リスクオフの兆候")
-
         if warnings:
             lines.append("")
             for w in warnings:
@@ -775,9 +893,7 @@ def generate_report(
     else:
         lines.append("  データ取得なし")
 
-    # ============================
-    # 銘柄テクニカル（diff付き）
-    # ============================
+    # 銘柄テクニカル
     lines.append("")
     lines.append("■ 銘柄テクニカル")
     lines.append("-" * 30)
@@ -788,16 +904,17 @@ def generate_report(
         if d is None:
             continue
 
-        # 決算接近マーカー
         earnings_mark = ""
         for e in earnings_calendar:
             if e["ticker"] == ticker and 0 <= e["days_until"] <= EARNINGS_WARN_DAYS:
-                earnings_mark = f" 📅決算{e['days_until']}日後" if e["days_until"] > 0 else " ⚡決算本日"
+                earnings_mark = (
+                    f" ⚡決算本日" if e["days_until"] == 0
+                    else f" 📅決算{e['days_until']}日後"
+                )
                 break
 
         lines.append(f"  {name} ({ticker}){earnings_mark}")
 
-        # 前日比 + 前日からの変化方向
         change_str = f"{d['change']:+.2f}%"
         if d.get("prev_change") is not None:
             momentum = d["change"] - d["prev_change"]
@@ -807,13 +924,14 @@ def generate_report(
                 momentum_icon = "📉 減速"
             else:
                 momentum_icon = "➡ 横ばい"
-            lines.append(f"    前日比: {change_str}  (前日: {d['prev_change']:+.2f}%) {momentum_icon}")
+            lines.append(
+                f"    前日比: {change_str}  (前日: {d['prev_change']:+.2f}%) {momentum_icon}"
+            )
         else:
             lines.append(f"    前日比: {change_str}")
 
         lines.append(f"    MA50: {d['ma50']}  MA200: {d['ma200']}")
 
-        # RSI + 前日比較
         rsi_str = f"{d['rsi']}"
         if d.get("rsi_prev") is not None:
             rsi_str += f"  ({diff_arrow(d['rsi'], d['rsi_prev'])})"
@@ -823,9 +941,7 @@ def generate_report(
         lines.append(f"    出来高倍率: {vol_str}")
         lines.append("")
 
-    # ============================
     # ニュース
-    # ============================
     lines.append("■ AI関連最新ニュース")
     lines.append("-" * 30)
     if translated_news:
@@ -842,9 +958,7 @@ def generate_report(
         lines.append("")
         lines.append("  ⚠ 崩れモード発動")
 
-    # ============================
     # 押し目候補
-    # ============================
     lines.append("")
     lines.append("■ 押し目候補")
     lines.append("-" * 30)
@@ -856,9 +970,7 @@ def generate_report(
     if not dip_found:
         lines.append("  該当なし")
 
-    # ============================
     # ポジション配分
-    # ============================
     lines.append("")
     lines.append("■ 推奨ポジション配分")
     lines.append("-" * 30)
@@ -878,7 +990,7 @@ def generate_report(
     return "\n".join(lines)
 
 
-# ===== メール送信（HTML強化版） =====
+# ===== メール送信 =====
 
 
 def send_email(
@@ -888,6 +1000,7 @@ def send_email(
     risk_flag: bool,
     macro_data: dict,
     event_alerts: list[str],
+    weekly_summary: str | None,
 ):
     gmail_user = os.getenv("GMAIL_ADDRESS")
     gmail_password = os.getenv("GMAIL_APP_PASSWORD")
@@ -896,15 +1009,22 @@ def send_email(
         logger.error("Gmail認証情報が設定されていません")
         return
 
-    # 件名にイベント警告を含める
+    # 件名
     if event_alerts and any("決算まで" in a and "🔴" in a for a in event_alerts):
         subject = "📅⚠ 決算接近アラート + AI市場レポート"
     elif risk_flag:
         subject = "⚠ AI市場警戒アラート"
+    elif weekly_summary:
+        subject = "📈 週次サマリー + AI市場レポート"
     else:
         subject = "📊 Daily AI Market Report"
 
-    # マクロサマリー行をHTML用に生成
+    # フルレポート（週次サマリーを結合）
+    full_report = report
+    if weekly_summary:
+        full_report += "\n" + weekly_summary
+
+    # マクロHTML
     macro_rows = ""
     for ticker, m in macro_data.items():
         sign = "+" if m["change"] >= 0 else ""
@@ -929,6 +1049,16 @@ def send_email(
         </div>
         """
 
+    # 週次サマリーHTML
+    weekly_html = ""
+    if weekly_summary:
+        weekly_html = f"""
+        <div style="background:#e8f5e9;border:1px solid #4caf50;border-radius:8px;padding:12px;margin:15px 0;">
+          <h3 style="margin:0 0 8px 0;">📈 週次サマリー</h3>
+          <pre style="font-size:12px;line-height:1.5;margin:0;white-space:pre-wrap;">{weekly_summary}</pre>
+        </div>
+        """
+
     # スコアバーの色
     if score >= 65:
         score_color = "#27ae60"
@@ -943,7 +1073,6 @@ def send_email(
       <h2 style="border-bottom:2px solid #333;">📊 AI市場プロレポート</h2>
       <p><b>日付:</b> {datetime.date.today()}</p>
 
-      <!-- スコアバー -->
       <div style="margin:15px 0;">
         <span style="font-size:18px;font-weight:bold;">市場温度: {score} {temp}</span>
         <div style="background:#eee;border-radius:10px;height:20px;width:100%;margin-top:5px;">
@@ -951,10 +1080,8 @@ def send_email(
         </div>
       </div>
 
-      <!-- イベントアラート -->
       {event_html}
 
-      <!-- マクロ指標テーブル -->
       <h3>🌍 マクロ環境</h3>
       <table style="border-collapse:collapse;width:100%;">
         <tr style="background:#f5f5f5;">
@@ -965,8 +1092,10 @@ def send_email(
         {macro_rows}
       </table>
 
+      {weekly_html}
+
       <hr style="margin:20px 0;">
-      <pre style="font-size:13px;line-height:1.6;background:#f9f9f9;padding:15px;border-radius:8px;">{report}</pre>
+      <pre style="font-size:13px;line-height:1.6;background:#f9f9f9;padding:15px;border-radius:8px;">{full_report}</pre>
     </body>
     </html>
     """
@@ -975,7 +1104,7 @@ def send_email(
     msg["Subject"] = subject
     msg["From"] = gmail_user
     msg["To"] = gmail_user
-    msg.attach(MIMEText(report, "plain"))
+    msg.attach(MIMEText(full_report, "plain"))
     msg.attach(MIMEText(html, "html"))
 
     try:
@@ -1000,7 +1129,6 @@ def main():
         if data:
             report_data[ticker] = data
 
-    # VIXは独立取得
     vix_data = fetch_technical_data(VIX_TICKER)
 
     # 2. マクロ指標取得
@@ -1013,7 +1141,7 @@ def main():
         earnings_calendar, fomc_upcoming
     )
 
-    # 4. スコアリング（マクロ指標も加味）
+    # 4. スコアリング
     score, risk_flag = calculate_score(report_data, vix_data, macro_data)
 
     # 5. イベントによるスコア調整
@@ -1038,7 +1166,7 @@ def main():
     # 9. リバランス判定
     rebalance = is_rebalance_day()
 
-    # 10. 銘柄別詳細配分（毎日最新データで計算）
+    # 10. 銘柄別詳細配分
     detailed_allocation = build_detailed_allocation(allocation, report_data)
 
     # 11. NVDAブースト
@@ -1059,10 +1187,25 @@ def main():
         event_alerts, earnings_calendar, fomc_upcoming,
     )
 
-    logger.info("\n" + report)
+    # 14. 週次サマリー（金曜のみ）
+    weekly_summary = None
+    if rebalance:
+        logger.info("金曜日: 週次サマリー生成中...")
+        weekly_data = fetch_weekly_performance()
+        weekly_summary = generate_weekly_summary(
+            weekly_data, score, temp, earnings_calendar
+        )
+        logger.info("週次サマリー生成完了")
 
-    # 14. メール送信
-    send_email(report, score, temp, risk_flag, macro_data, event_alerts)
+    logger.info("\n" + report)
+    if weekly_summary:
+        logger.info("\n" + weekly_summary)
+
+    # 15. メール送信
+    send_email(
+        report, score, temp, risk_flag, macro_data,
+        event_alerts, weekly_summary,
+    )
 
     logger.info("===== 処理完了 =====")
 

@@ -1,0 +1,4 @@
+.env
+last_allocation.json
+__pycache__/
+*.pyc
